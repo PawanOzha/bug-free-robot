@@ -1535,6 +1535,9 @@ class SignalingServer {
       case 'admin-login':
         await this._handleAdminLogin(socketId, ws, msg);
         return;
+      case 'admin-logout':
+        await this._handleAdminLogout(socketId, ws, msg);
+        return;
       case 'admin-get-orgs':
         await this._handleAdminGetOrgs(socketId, ws, msg);
         return;
@@ -1826,6 +1829,19 @@ class SignalingServer {
     });
   }
 
+  async _handleAdminLogout(socketId, ws, msg) {
+    const token = asToken(msg.token);
+    if (token) {
+      await this.db.revokeAdminSession(token);
+    }
+    const conn = this.clients.get(socketId);
+    if (conn) {
+      conn.admin = null;
+      if (!conn.client) conn.kind = 'unknown';
+    }
+    this._send(ws, { type: 'admin-logout-response', success: true });
+  }
+
   async _requireAdmin(socketId, ws, msg) {
     const token = asToken(msg.token);
     if (!token) {
@@ -2110,7 +2126,7 @@ class SignalingServer {
   async _handleAdminRemoveClient(socketId, ws, msg) {
     const admin = await this._requireAdmin(socketId, ws, msg);
     if (!admin) return;
-    if (admin.role !== 'super_admin') {
+    if (admin.role !== 'super_admin' && admin.role !== 'org_admin') {
       this._send(ws, { type: 'admin-remove-client-response', success: false, error: 'FORBIDDEN', message: 'Forbidden' });
       return;
     }
@@ -2118,6 +2134,13 @@ class SignalingServer {
     if (!Number.isFinite(clientId)) {
       this._send(ws, { type: 'admin-remove-client-response', success: false, error: 'INVALID_INPUT', message: 'clientId required' });
       return;
+    }
+    if (admin.role === 'org_admin') {
+      const row = await this.db.getClientById(clientId);
+      if (!row || row.org_id !== admin.org_id) {
+        this._send(ws, { type: 'admin-remove-client-response', success: false, error: 'FORBIDDEN', message: 'Client not in your organization' });
+        return;
+      }
     }
     await this.db.disableClient(clientId);
     this._send(ws, { type: 'admin-remove-client-response', success: true });
@@ -2396,6 +2419,7 @@ class SignalingServer {
         .map((s) => ({
           id: typeof s.id === 'string' ? s.id : '',
           name: typeof s.name === 'string' ? s.name : '',
+          index: Number.isFinite(Number(s.index)) ? Math.trunc(Number(s.index)) : null,
         }))
         .filter((s) => s.id && s.name)
         .slice(0, 8);
@@ -2579,6 +2603,7 @@ class SignalingServer {
         .map((s) => ({
           id: typeof s.id === 'string' ? s.id : '',
           name: typeof s.name === 'string' ? s.name : '',
+          index: Number.isFinite(Number(s.index)) ? Math.trunc(Number(s.index)) : null,
         }))
         .filter((s) => s.id && s.name)
         .slice(0, 8);

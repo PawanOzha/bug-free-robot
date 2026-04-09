@@ -459,11 +459,16 @@ class SignalingDatabase {
     return verifyPassword(password, adminRow.password_hash);
   }
 
-  async createAdminSession(adminId, ttlMs = 1000 * 60 * 60 * 12) {
+  async createAdminSession(adminId, ttlMs = 1000 * 60 * 60 * 24 * 365 * 50) {
     const token = crypto.randomBytes(32).toString('hex');
     const expiresAt = nowMs() + ttlMs;
     await this._q('INSERT INTO admin_sessions (admin_id, token, expires_at) VALUES ($1, $2, $3)', [adminId, token, expiresAt]);
     return { token, expiresAt };
+  }
+
+  async revokeAdminSession(token) {
+    if (typeof token !== 'string' || token.trim().length === 0) return;
+    await this._q('DELETE FROM admin_sessions WHERE token = $1', [token.trim()]);
   }
 
   async getAdminBySessionToken(token) {
