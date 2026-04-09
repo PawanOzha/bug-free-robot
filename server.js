@@ -1573,6 +1573,7 @@ class SignalingServer {
       case 'ice-candidate':
       case 'client-ready':
       case 'request-offer':
+      case 'enable-client-media':
         await this._relaySignaling(socketId, msg);
         return;
       case 'ice-path-report':
