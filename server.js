@@ -1,6 +1,7 @@
 const { WebSocketServer } = require('ws');
 const crypto = require('crypto');
 const http = require('http');
+const https = require('https');
 const path = require('path');
 const fs = require('fs');
 const dotenv = require('dotenv');
@@ -157,6 +158,81 @@ function normalizeIceServersFromJson(parsed) {
   return out.length > 0 ? out : null;
 }
 
+/** Strip browser-blocked :53 URLs from Cloudflare API iceServers before sending to clients. */
+function filterPort53FromCloudflareIceServers(entries) {
+  const out = [];
+  for (const entry of entries) {
+    if (!entry || typeof entry !== 'object') continue;
+    const urlsRaw = entry.urls;
+    const list = Array.isArray(urlsRaw)
+      ? urlsRaw.filter((u) => typeof u === 'string' && u.trim().length > 0)
+      : typeof urlsRaw === 'string' && urlsRaw.trim().length > 0
+        ? [urlsRaw.trim()]
+        : [];
+    const filtered = list.filter((u) => !u.includes(':53'));
+    if (filtered.length === 0) continue;
+    const row = { urls: filtered.length === 1 ? filtered[0] : filtered };
+    if (typeof entry.username === 'string' && entry.username.trim()) row.username = entry.username.trim();
+    if (typeof entry.credential === 'string' && entry.credential.trim()) row.credential = entry.credential.trim();
+    out.push(row);
+  }
+  return out;
+}
+
+/**
+ * Fetches short-lived Cloudflare TURN/STUN iceServers via API. Returns [] if unset, failed, or misconfigured.
+ */
+async function fetchCloudflareIceServers() {
+  const keyId = (process.env.CLOUDFLARE_TURN_KEY_ID || '').trim();
+  const apiToken = (process.env.CLOUDFLARE_TURN_KEY_API_TOKEN || '').trim();
+  if (!keyId || !apiToken) return [];
+  try {
+    const body = JSON.stringify({ ttl: 86400 });
+    const pathOnly = `/v1/turn/keys/${encodeURIComponent(keyId)}/credentials/generate-ice-servers`;
+    const result = await new Promise((resolve, reject) => {
+      const req = https.request(
+        {
+          hostname: 'rtc.live.cloudflare.com',
+          path: pathOnly,
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${apiToken}`,
+            'Content-Type': 'application/json',
+            'Content-Length': Buffer.byteLength(body, 'utf8'),
+          },
+        },
+        (res) => {
+          const chunks = [];
+          res.on('data', (d) => chunks.push(d));
+          res.on('end', () => {
+            resolve({ statusCode: res.statusCode, body: Buffer.concat(chunks).toString('utf8') });
+          });
+        },
+      );
+      req.on('error', reject);
+      req.write(body);
+      req.end();
+    });
+    if (result.statusCode < 200 || result.statusCode >= 300) {
+      console.warn('[ICE][Cloudflare] API error', result.statusCode, result.body.slice(0, 240));
+      return [];
+    }
+    let parsed;
+    try {
+      parsed = JSON.parse(result.body);
+    } catch (e) {
+      console.warn('[ICE][Cloudflare] JSON parse failed:', e?.message || e);
+      return [];
+    }
+    const raw = Array.isArray(parsed.iceServers) ? parsed.iceServers : null;
+    if (!raw) return [];
+    return filterPort53FromCloudflareIceServers(raw);
+  } catch (e) {
+    console.warn('[ICE][Cloudflare] request failed:', e?.message || e);
+    return [];
+  }
+}
+
 function buildIceServers(turnUsername = process.env.TURN_USERNAME, turnCredential = process.env.TURN_CREDENTIAL, logConfig = true) {
   const jsonEnv = process.env.ICE_SERVERS_JSON || process.env.ANYWHERE_ICE_SERVERS_JSON;
   if (jsonEnv && String(jsonEnv).trim()) {
@@ -181,13 +257,6 @@ function buildIceServers(turnUsername = process.env.TURN_USERNAME, turnCredentia
   const turnTcpUrl = process.env.TURN_TCP_URL;
   const turnTlsTcpUrl = process.env.TURN_TLSTCP_URL;
   const iceServers = [
-    {
-      urls: [
-        'stun:stun.l.google.com:19302',
-        'stun:stun1.l.google.com:19302',
-        'stun:stun2.l.google.com:19302',
-      ],
-    },
     ...(turnStunUrl ? [{ urls: turnStunUrl }] : []),
     ...(turnUdpUrl ? [{ urls: turnUdpUrl, username: turnUsername, credential: turnCredential }] : []),
     ...(turnTcpUrl ? [{ urls: turnTcpUrl, username: turnUsername, credential: turnCredential }] : []),
@@ -213,14 +282,19 @@ function buildIceServers(turnUsername = process.env.TURN_USERNAME, turnCredentia
   }
 
   if (logConfig) {
-    console.log('✅ ICE config loaded:');
-    console.log('   STUN (public):', ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302', 'stun:stun2.l.google.com:19302']);
-    console.log('   STUN (CoTURN):', turnStunUrl || '(missing)');
+    console.log('✅ ICE config loaded (default path — home first, no public Google STUN):');
+    console.log('   STUN (home):', turnStunUrl || '(missing)');
     console.log('   TURN UDP:', turnUdpUrl || '(missing)');
     console.log('   TURN TCP:', turnTcpUrl || '(missing)');
     console.log('   TURNS TCP:', turnTlsTcpUrl || '(missing)');
     console.log('   TURN username present:', !!turnUsername);
     console.log('   TURN credential present:', !!turnCredential);
+    console.log(
+      '   Cloudflare API (per connection):',
+      (process.env.CLOUDFLARE_TURN_KEY_ID || '').trim() && (process.env.CLOUDFLARE_TURN_KEY_API_TOKEN || '').trim()
+        ? 'enabled when keys set'
+        : '(not configured)',
+    );
   }
 
   return iceServers;
@@ -242,6 +316,20 @@ function mintTurnCredentials(ttlSeconds = 86400) {
   return { username, credential };
 }
 const ICE_SERVERS = buildIceServers();
+if (process.env.NODE_ENV !== 'production') {
+  void (async () => {
+    const cf = await fetchCloudflareIceServers();
+    const merged = [...ICE_SERVERS, ...cf];
+    console.log(
+      '[ICE][dev] merged iceServers preview (home → Cloudflare, credentials redacted):',
+      merged.map((entry) => ({
+        urls: entry.urls,
+        username: entry.username ? '(set)' : undefined,
+        credential: entry.credential ? '(set)' : undefined,
+      })),
+    );
+  })();
+}
 const isProduction = process.env.NODE_ENV === 'production';
 const hasTurn = ICE_SERVERS.some((s) =>
   (Array.isArray(s.urls) ? s.urls : [s.urls])
@@ -508,10 +596,21 @@ class SignalingServer {
         console.error(`❌ WebSocket error for ${socketId}:`, err.message);
       });
 
-      // Send welcome with socket ID + WebRTC ICE config (supports static or ephemeral TURN credentials).
-      const { username, credential } = mintTurnCredentials(86400);
-      const iceServersForPeer = buildIceServers(username, credential, false);
-      this._send(ws, { type: 'welcome', socketId: socketId, iceServers: iceServersForPeer });
+      // Send welcome with socket ID + WebRTC ICE config (home lab + optional Cloudflare API iceServers).
+      void (async () => {
+        try {
+          const { username, credential } = mintTurnCredentials(86400);
+          const homeIceServers = buildIceServers(username, credential, false);
+          const cloudflareIceServers = await fetchCloudflareIceServers();
+          const iceServersForPeer = [...homeIceServers, ...cloudflareIceServers];
+          this._send(ws, { type: 'welcome', socketId: socketId, iceServers: iceServersForPeer });
+        } catch (err) {
+          console.warn('[welcome] ICE merge failed, sending home-only:', err?.message || err);
+          const { username, credential } = mintTurnCredentials(86400);
+          const homeIceServers = buildIceServers(username, credential, false);
+          this._send(ws, { type: 'welcome', socketId: socketId, iceServers: homeIceServers });
+        }
+      })();
     });
 
     this.httpServer.listen(PORT, () => {
