@@ -465,6 +465,7 @@ class SignalingServer {
     this.sessionCleanupTimer = null;
     /** adminSocketId -> Set<clientSocketId> — tear down client WebRTC when admin stops or disconnects */
     this.adminViewerLinks = new Map();
+    /** client socket metadata (published screen sources) is held on each live connection. */
   }
 
   async start() {
@@ -548,6 +549,7 @@ class SignalingServer {
         ip,
         ipStatusSent: false,
         workstationIps: [],
+        screenSources: [],
       });
       console.log(`🔌 New connection: ${socketId} (${ip}, total: ${this.clients.size})`);
 
@@ -1574,6 +1576,7 @@ class SignalingServer {
       case 'client-ready':
       case 'request-offer':
       case 'enable-client-media':
+      case 'client-screen-sources':
         await this._relaySignaling(socketId, msg);
         return;
       case 'ice-path-report':
@@ -2384,6 +2387,22 @@ class SignalingServer {
     const { targetSocketId, targetName, ...payload } = msg;
 
     let target = null;
+    const msgType = asNonEmptyString(payload?.type, 64);
+    const fromConn = this.clients.get(socketId);
+    if (msgType === 'client-screen-sources' && fromConn?.kind === 'client') {
+      const list = Array.isArray(payload.sources) ? payload.sources : [];
+      fromConn.screenSources = list
+        .filter((s) => s && typeof s === 'object')
+        .map((s) => ({
+          id: typeof s.id === 'string' ? s.id : '',
+          name: typeof s.name === 'string' ? s.name : '',
+        }))
+        .filter((s) => s.id && s.name)
+        .slice(0, 8);
+      if (fromConn.client?.orgId) {
+        void this._broadcastClientsListToAdmins(fromConn.client.orgId);
+      }
+    }
 
     if (targetSocketId) {
       target = this.clients.get(targetSocketId);
@@ -2392,8 +2411,11 @@ class SignalingServer {
       target = this._findConnectionByName(targetName);
     }
 
+    if (msgType === 'client-screen-sources' && !target) {
+      return;
+    }
+
     if (target && isOpen(target.ws)) {
-      const fromConn = this.clients.get(socketId);
       if (!fromConn) return;
 
       const fromClient = fromConn.kind === 'client' ? fromConn.client : null;
@@ -2545,9 +2567,29 @@ class SignalingServer {
     }
   }
 
+  _screenSourcesForClientId(clientId) {
+    const cid = Number(clientId);
+    if (!Number.isFinite(cid) || cid <= 0) return [];
+    for (const [, conn] of this.clients) {
+      if (conn?.kind !== 'client') continue;
+      if (!conn.client || Number(conn.client.id) !== cid) continue;
+      const raw = Array.isArray(conn.screenSources) ? conn.screenSources : [];
+      return raw
+        .filter((s) => s && typeof s === 'object')
+        .map((s) => ({
+          id: typeof s.id === 'string' ? s.id : '',
+          name: typeof s.name === 'string' ? s.name : '',
+        }))
+        .filter((s) => s.id && s.name)
+        .slice(0, 8);
+    }
+    return [];
+  }
+
   _mapAdminClientRow(c) {
+    const id = c.id;
     return {
-      id: c.id,
+      id,
       fullName: c.full_name || c.fullName,
       status: c.status || 'offline',
       orgId: c.org_id != null ? c.org_id : c.orgId,
@@ -2556,6 +2598,7 @@ class SignalingServer {
       lastHeartbeatMs: c.last_heartbeat != null ? Number(c.last_heartbeat) : null,
       lastOnlineMs: c.last_online_at != null ? Number(c.last_online_at) : null,
       lastOfflineMs: c.last_offline_at != null ? Number(c.last_offline_at) : null,
+      screenSources: this._screenSourcesForClientId(id),
     };
   }
 
