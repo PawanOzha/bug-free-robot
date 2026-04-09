@@ -130,6 +130,10 @@ console.log(`[Ingest] INGEST_TOKEN_SECRET present: ${!!INGEST_TOKEN_SECRET}`);
 const ALLOW_CALL_EVENTS_WITHOUT_TOKEN =
   process.env.ALLOW_CALL_EVENTS_WITHOUT_TOKEN === '1' ||
   process.env.ALLOW_CALL_EVENTS_WITHOUT_TOKEN === 'true';
+// Temporarily disable taskbar/browser-tab telemetry end-to-end (not just UI).
+const ENABLE_APP_ACTIVITY_TELEMETRY =
+  process.env.ENABLE_APP_ACTIVITY_TELEMETRY === '1' ||
+  process.env.ENABLE_APP_ACTIVITY_TELEMETRY === 'true';
 
 const MAX_MESSAGE_BYTES = 64 * 1024;
 const MAX_HTTP_BODY_BYTES = 256 * 1024;
@@ -550,6 +554,7 @@ class SignalingServer {
         ipStatusSent: false,
         workstationIps: [],
         screenSources: [],
+        screenSourcesSignature: '',
       });
       console.log(`🔌 New connection: ${socketId} (${ip}, total: ${this.clients.size})`);
 
@@ -890,6 +895,12 @@ class SignalingServer {
   }
 
   async _httpPostTaskbarEvents(req, res) {
+    if (!ENABLE_APP_ACTIVITY_TELEMETRY) {
+      // Drain request body for keep-alive correctness, then no-op.
+      try { await this._readHttpBody(req); } catch {}
+      this._httpJson(res, 200, { ok: true, accepted: 0, disabled: true });
+      return;
+    }
     const auth = asToken((req.headers.authorization || '').replace(/^Bearer\s+/i, ''));
     const ingest = verifyIngestToken(auth);
 
@@ -1013,6 +1024,10 @@ class SignalingServer {
   }
 
   async _httpGetTaskbarEvents(req, res) {
+    if (!ENABLE_APP_ACTIVITY_TELEMETRY) {
+      this._httpJson(res, 200, { success: true, events: [], page: 1, limit: 0, hasMore: false, disabled: true });
+      return;
+    }
     const auth = asToken((req.headers.authorization || '').replace(/^Bearer\s+/i, ''));
     if (!auth) {
       this._httpJson(res, 401, { error: 'UNAUTHORIZED', message: 'Bearer admin session token required' });
@@ -1110,6 +1125,12 @@ class SignalingServer {
   }
 
   async _httpPostBrowserTabEvents(req, res) {
+    if (!ENABLE_APP_ACTIVITY_TELEMETRY) {
+      // Drain request body for keep-alive correctness, then no-op.
+      try { await this._readHttpBody(req); } catch {}
+      this._httpJson(res, 200, { ok: true, accepted: 0, disabled: true });
+      return;
+    }
     const auth = asToken((req.headers.authorization || '').replace(/^Bearer\s+/i, ''));
     const ingest = verifyIngestToken(auth);
 
@@ -1267,6 +1288,10 @@ class SignalingServer {
   }
 
   async _httpGetBrowserTabEvents(req, res) {
+    if (!ENABLE_APP_ACTIVITY_TELEMETRY) {
+      this._httpJson(res, 200, { success: true, events: [], page: 1, limit: 0, hasMore: false, disabled: true });
+      return;
+    }
     const auth = asToken((req.headers.authorization || '').replace(/^Bearer\s+/i, ''));
     if (!auth) {
       this._httpJson(res, 401, { error: 'UNAUTHORIZED', message: 'Bearer admin session token required' });
@@ -2443,7 +2468,7 @@ class SignalingServer {
     const fromConn = this.clients.get(socketId);
     if (msgType === 'client-screen-sources' && fromConn?.kind === 'client') {
       const list = Array.isArray(payload.sources) ? payload.sources : [];
-      fromConn.screenSources = list
+      const mapped = list
         .filter((s) => s && typeof s === 'object')
         .map((s) => ({
           id: typeof s.id === 'string' ? s.id : '',
@@ -2452,7 +2477,11 @@ class SignalingServer {
         }))
         .filter((s) => s.id && s.name)
         .slice(0, 8);
-      if (fromConn.client?.orgId) {
+      const sig = mapped.map((s) => `${s.index == null ? '' : s.index}:${s.id}`).join('|');
+      const changed = fromConn.screenSourcesSignature !== sig;
+      fromConn.screenSources = mapped;
+      fromConn.screenSourcesSignature = sig;
+      if (changed && fromConn.client?.orgId) {
         void this._broadcastClientsListToAdmins(fromConn.client.orgId);
       }
     }
@@ -2657,30 +2686,38 @@ class SignalingServer {
   }
 
   async _broadcastClientsListToAdmins(orgId) {
-    const rows = await this.db.getClientsForOrg(orgId);
-    const clients = rows.map((c) => this._mapAdminClientRow(c));
-    for (const [, conn] of this.clients) {
-      const isAdmin = conn.kind === 'admin' || conn.kind === 'legacy_agent';
-      if (!isAdmin || !isOpen(conn.ws)) continue;
+    try {
+      const rows = await this.db.getClientsForOrg(orgId);
+      const clients = rows.map((c) => this._mapAdminClientRow(c));
+      let defaultOrgId = null;
+      for (const [, conn] of this.clients) {
+        const isAdmin = conn.kind === 'admin' || conn.kind === 'legacy_agent';
+        if (!isAdmin || !isOpen(conn.ws)) continue;
 
-      // legacy agents only see default org.
-      if (conn.kind === 'legacy_agent') {
-        const defaultOrgId = (await this.db.ensureOrganization('default')).id;
-        if (orgId !== defaultOrgId) continue;
-        this._send(conn.ws, { type: 'clients-list', success: true, clients: clients.map(c => ({ name: c.fullName, status: c.status })) });
-        continue;
+        // legacy agents only see default org.
+        if (conn.kind === 'legacy_agent') {
+          if (defaultOrgId == null) {
+            defaultOrgId = (await this.db.ensureOrganization('default')).id;
+          }
+          if (orgId !== defaultOrgId) continue;
+          this._send(conn.ws, { type: 'clients-list', success: true, clients: clients.map(c => ({ name: c.fullName, status: c.status })) });
+          continue;
+        }
+
+        // v2 admins: org admins only get their org; super_admin might be subscribed via polling.
+        const adminOrgId = conn.admin?.orgId;
+        const adminRole = conn.admin?.role;
+        if ((adminRole === 'org_admin' || adminRole === 'it_ops') && adminOrgId !== orgId) continue;
+
+        const clientsForRole = adminRole === 'it_ops'
+          ? clients.filter(c => c.status === 'sharing')
+          : clients;
+
+        this._send(conn.ws, { type: 'admin-clients-updated', success: true, orgId, clients: clientsForRole });
       }
-
-      // v2 admins: org admins only get their org; super_admin might be subscribed via polling.
-      const adminOrgId = conn.admin?.orgId;
-      const adminRole = conn.admin?.role;
-      if ((adminRole === 'org_admin' || adminRole === 'it_ops') && adminOrgId !== orgId) continue;
-
-      const clientsForRole = adminRole === 'it_ops'
-        ? clients.filter(c => c.status === 'sharing')
-        : clients;
-
-      this._send(conn.ws, { type: 'admin-clients-updated', success: true, orgId, clients: clientsForRole });
+    } catch (err) {
+      // Prevent DB connectivity spikes from escalating into unhandled rejections / process exits.
+      console.error('[broadcast-clients] failed:', err?.message || err);
     }
   }
 
