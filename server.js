@@ -2135,14 +2135,43 @@ class SignalingServer {
       this._send(ws, { type: 'admin-remove-client-response', success: false, error: 'INVALID_INPUT', message: 'clientId required' });
       return;
     }
+    const row = await this.db.getClientById(clientId);
+    if (!row) {
+      this._send(ws, { type: 'admin-remove-client-response', success: false, error: 'NOT_FOUND', message: 'Client not found' });
+      return;
+    }
     if (admin.role === 'org_admin') {
-      const row = await this.db.getClientById(clientId);
-      if (!row || row.org_id !== admin.org_id) {
+      if (row.org_id !== admin.org_id) {
         this._send(ws, { type: 'admin-remove-client-response', success: false, error: 'FORBIDDEN', message: 'Client not in your organization' });
         return;
       }
     }
     await this.db.disableClient(clientId);
+    if (row.org_id) {
+      void this._broadcastClientsListToAdmins(row.org_id);
+    }
+    // Force immediate logout on the client app side.
+    if (row.socket_id) {
+      const clientConn = this.clients.get(row.socket_id);
+      if (clientConn && clientConn.kind === 'client' && isOpen(clientConn.ws)) {
+        this._send(clientConn.ws, {
+          type: 'client-auth-response',
+          success: false,
+          error: 'CLIENT_DISABLED',
+          message: 'This device was removed by an administrator.',
+        });
+        this._send(clientConn.ws, {
+          type: 'client-disabled',
+          success: true,
+          message: 'This device was removed by an administrator.',
+        });
+        try {
+          clientConn.ws.close();
+        } catch {
+          /* ignore */
+        }
+      }
+    }
     this._send(ws, { type: 'admin-remove-client-response', success: true });
   }
 
