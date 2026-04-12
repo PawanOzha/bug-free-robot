@@ -9,9 +9,10 @@
     "dev": "node server.js",
     "reset-db": "node scripts/reset-db.js",
     "start:fresh": "node -e \"process.env.SIGNALING_WIPE_DB='1'; require('./server.js');\"",
-    "lint": "node --check server.js database.js scripts/reset-db.js",
-    "typecheck": "node --check server.js database.js",
+    "lint": "node --check server.js database.js auditOrgAccessProxy.js scripts/reset-db.js scripts/verify-audit-proxy.js",
+    "typecheck": "node --check server.js database.js auditOrgAccessProxy.js",
     "test": "npm run lint && npm run typecheck",
+    "verify:audit-proxy": "node scripts/verify-audit-proxy.js",
     "db:check": "node scripts/db-check.js",
     "mint:token": "node scripts/mint-ingest-token.js --clientId=1 --orgId=1"
   },

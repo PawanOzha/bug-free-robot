@@ -6,6 +6,7 @@ const path = require('path');
 const fs = require('fs');
 const dotenv = require('dotenv');
 const SignalingDatabase = require('./database');
+const auditOrgAccessProxy = require('./auditOrgAccessProxy');
 const { isOnOfficeNetwork, getOfficeNetworkLabel } = require('./ipUtils');
 
 /** Sanitize LAN IPs reported by the Electron admin app (used when the server only sees public/WAN). */
@@ -1595,6 +1596,14 @@ class SignalingServer {
         return;
       case 'admin-set-ui-features':
         await this._handleAdminSetUiFeatures(socketId, ws, msg);
+        return;
+
+      // ─── Audit dashboard (super-admin proxy over WS; server forwards to audit HTTP) ───
+      case 'admin-audit-org-access-list':
+        await auditOrgAccessProxy.handleList(this, socketId, ws, msg);
+        return;
+      case 'admin-audit-org-access-review':
+        await auditOrgAccessProxy.handleReview(this, socketId, ws, msg);
         return;
 
       // ─── WebRTC relay ───
