@@ -10,7 +10,7 @@ COPY package.json package-lock.json ./
 RUN npm ci --production
 
 # Copy application code
-COPY server.js database.js ipUtils.js ./
+COPY server.js database.js ipUtils.js auditOrgAccessProxy.js ./
 COPY scripts/ scripts/
 
 EXPOSE 8085
