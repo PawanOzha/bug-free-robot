@@ -1269,11 +1269,14 @@ class SignalingServer {
             if (!x || typeof x !== 'object') continue;
             const o = x;
             const ts = Number(o.ts);
-            const detail = typeof o.detail === 'string' ? o.detail.slice(0, 4000) : '';
+            // Keep full interaction text for audit detail view; cap high to avoid unbounded payloads.
+            const detail = typeof o.detail === 'string' ? o.detail.slice(0, 20000) : '';
             const eventType = typeof o.eventType === 'string' ? o.eventType.slice(0, 128) : typeof o.event_type === 'string' ? o.event_type.slice(0, 128) : 'unknown';
             const tabIdRaw = o.tabId ?? o.tab_id;
             const tabId = Number.isFinite(Number(tabIdRaw)) ? Math.round(Number(tabIdRaw)) : null;
-            if (Number.isFinite(ts) && ts > 0) trimmed.push({ ts, eventType, tabId, detail });
+            const url = typeof o.url === 'string' ? o.url.slice(0, 1200) : '';
+            const title = typeof o.title === 'string' ? o.title.slice(0, 400) : '';
+            if (Number.isFinite(ts) && ts > 0) trimmed.push({ ts, eventType, tabId, detail, url, title });
           }
           session = { ...session, recentInteractions: trimmed };
         }
