@@ -6,6 +6,24 @@
  * using AUDIT_DASHBOARD_URL + AUDIT_SUPERADMIN_SERVICE_SECRET on the signaling host.
  */
 
+/**
+ * Node/undici often throws TypeError with message "fetch failed"; the real reason is in `cause`
+ * (e.g. ECONNREFUSED, certificate hostname mismatch). Flatten for admin UI + logs.
+ */
+function formatNetworkError(err) {
+  if (err == null) return 'Unknown error';
+  const parts = [];
+  let e = err;
+  for (let depth = 0; e && depth < 6; depth += 1) {
+    const msg = e instanceof Error ? e.message : String(e);
+    if (msg && !parts.includes(msg)) parts.push(msg);
+    const code = typeof e.code === 'string' ? e.code : null;
+    if (code && !parts.some((p) => p.includes(code))) parts.push(`(${code})`);
+    e = e.cause;
+  }
+  return parts.length ? parts.join(' — ') : 'Unknown error';
+}
+
 /** Allow AUDIT_DASHBOARD_URL=localhost:3000 (prepend http:// for fetch). */
 function normalizeAuditOrigin(raw) {
   const s = String(raw || '').trim().replace(/\/$/, '');
@@ -100,11 +118,13 @@ async function handleList(signaling, socketId, ws, msg) {
       ipcCorrId,
     });
   } catch (err) {
+    const detail = formatNetworkError(err);
+    console.warn('[auditOrgAccessProxy] list fetch failed', { detail, target: `${origin}/api/superadmin/audit-org-access` });
     signaling._send(ws, {
       type: 'admin-audit-org-access-list-response',
       success: false,
       error: 'AUDIT_PROXY_FETCH_FAILED',
-      message: err instanceof Error ? err.message : String(err),
+      message: detail,
       ipcCorrId,
     });
   }
@@ -171,11 +191,13 @@ async function handleReview(signaling, socketId, ws, msg) {
       ipcCorrId,
     });
   } catch (err) {
+    const detail = formatNetworkError(err);
+    console.warn('[auditOrgAccessProxy] review fetch failed', { detail, target: `${origin}/api/superadmin/audit-org-access` });
     signaling._send(ws, {
       type: 'admin-audit-org-access-review-response',
       success: false,
       error: 'AUDIT_PROXY_FETCH_FAILED',
-      message: err instanceof Error ? err.message : String(err),
+      message: detail,
       ipcCorrId,
     });
   }

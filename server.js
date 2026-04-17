@@ -749,10 +749,11 @@ class SignalingServer {
     })().catch(() => {});
   }
 
-  _broadcastBrowserTabEventsToAdmins(clientId, count, latestTabs, activeTabId, browserName) {
+  _broadcastBrowserTabEventsToAdmins(clientId, count, latestTabs, activeTabId, browserName, recentInteractions) {
     void (async () => {
       const client = await this.db.getClientById(clientId);
       if (!client) return;
+      const ri = Array.isArray(recentInteractions) ? recentInteractions : [];
       for (const [, conn] of this.clients) {
         if (conn.kind !== 'admin' || !isOpen(conn.ws)) continue;
         const role = conn.admin?.role;
@@ -770,6 +771,7 @@ class SignalingServer {
           browserName: browserName || 'Chromium',
           activeTabId: activeTabId ?? null,
           tabs: latestTabs || [],
+          recentInteractions: ri,
         });
       }
     })().catch(() => {});
@@ -1233,7 +1235,18 @@ class SignalingServer {
       const isAudible = v.isAudible === true;
       const isMuted = v.isMuted === true;
       if (!title && !url) return null;
-      return { tabId, windowId, title, url, domain, favIconUrl, isPinned, isAudible, isMuted, isActive, activeMs, foregroundMs, switchCount, createdMs, lastSeenMs, lastActiveMs };
+      const dwellIdleMsRaw = Number(v.dwellIdleMs ?? v.dwell_idle_ms ?? 0);
+      const keystrokesRaw = Number(v.keystrokes ?? 0);
+      const scrollPxRaw = Number(v.scrollPx ?? v.scroll_px ?? 0);
+      const mousePxRaw = Number(v.mousePx ?? v.mouse_px ?? 0);
+      const clicksRaw = Number(v.clicks ?? 0);
+      const out = { tabId, windowId, title, url, domain, favIconUrl, isPinned, isAudible, isMuted, isActive, activeMs, foregroundMs, switchCount, createdMs, lastSeenMs, lastActiveMs };
+      if (Number.isFinite(dwellIdleMsRaw) && dwellIdleMsRaw >= 0) out.dwellIdleMs = Math.min(Math.round(dwellIdleMsRaw), 31_536_000_000);
+      if (Number.isFinite(keystrokesRaw) && keystrokesRaw >= 0) out.keystrokes = Math.min(Math.round(keystrokesRaw), 1_000_000_000);
+      if (Number.isFinite(scrollPxRaw) && scrollPxRaw >= 0) out.scrollPx = Math.round(scrollPxRaw);
+      if (Number.isFinite(mousePxRaw) && mousePxRaw >= 0) out.mousePx = Math.round(mousePxRaw);
+      if (Number.isFinite(clicksRaw) && clicksRaw >= 0) out.clicks = Math.min(Math.round(clicksRaw), 1_000_000_000);
+      return out;
     };
 
     try {
@@ -1248,7 +1261,22 @@ class SignalingServer {
         const activeTabIdRaw = Number(e?.activeTabId ?? e?.active_tab_id);
         const activeTabId = Number.isFinite(activeTabIdRaw) ? Math.round(activeTabIdRaw) : null;
         const reason = asNonEmptyString(e?.reason, 80) || 'update';
-        const session = e?.session && typeof e.session === 'object' ? e.session : null;
+        let session = e?.session && typeof e.session === 'object' ? { ...e.session } : {};
+        const riTop = Array.isArray(e?.recentInteractions) ? e.recentInteractions : Array.isArray(e?.recent_interactions) ? e.recent_interactions : null;
+        if (riTop && riTop.length > 0) {
+          const trimmed = [];
+          for (const x of riTop.slice(0, 80)) {
+            if (!x || typeof x !== 'object') continue;
+            const o = x;
+            const ts = Number(o.ts);
+            const detail = typeof o.detail === 'string' ? o.detail.slice(0, 4000) : '';
+            const eventType = typeof o.eventType === 'string' ? o.eventType.slice(0, 128) : typeof o.event_type === 'string' ? o.event_type.slice(0, 128) : 'unknown';
+            const tabIdRaw = o.tabId ?? o.tab_id;
+            const tabId = Number.isFinite(Number(tabIdRaw)) ? Math.round(Number(tabIdRaw)) : null;
+            if (Number.isFinite(ts) && ts > 0) trimmed.push({ ts, eventType, tabId, detail });
+          }
+          session = { ...session, recentInteractions: trimmed };
+        }
         const switchLogRaw = Array.isArray(e?.switchLog ?? e?.switch_log) ? (e.switchLog ?? e.switch_log) : [];
         const tabsRaw = Array.isArray(e?.tabs) ? e.tabs : [];
         const tabs = tabsRaw.map(normalizeTab).filter(Boolean).slice(0, 200);
@@ -1269,7 +1297,7 @@ class SignalingServer {
           browserName,
           activeTabId,
           reason,
-          sessionJson: JSON.stringify(session || {}),
+          sessionJson: JSON.stringify(Object.keys(session).length ? session : {}),
           switchLogJson: JSON.stringify(switchLog),
           tabsJson: JSON.stringify(tabs),
         });
@@ -1283,8 +1311,17 @@ class SignalingServer {
     const latestTabs = rows.length > 0 ? JSON.parse(rows[rows.length - 1].tabsJson) : [];
     const latestActiveTabId = rows.length > 0 ? rows[rows.length - 1].activeTabId : null;
     const latestBrowser = rows.length > 0 ? rows[rows.length - 1].browserName : 'Chromium';
+    let latestRecentInteractions = [];
+    if (rows.length > 0) {
+      try {
+        const lastSess = JSON.parse(rows[rows.length - 1].sessionJson || '{}');
+        if (Array.isArray(lastSess.recentInteractions)) latestRecentInteractions = lastSess.recentInteractions;
+      } catch {
+        /* ignore */
+      }
+    }
     console.log(`[Received from Client ---] Browser tab events: ${accepted} event(s) ingested for clientId=${clientId} | tabs=${latestTabs.length}`);
-    this._broadcastBrowserTabEventsToAdmins(clientId, accepted, latestTabs, latestActiveTabId, latestBrowser);
+    this._broadcastBrowserTabEventsToAdmins(clientId, accepted, latestTabs, latestActiveTabId, latestBrowser, latestRecentInteractions);
     this._httpJson(res, 200, { ok: true, accepted });
   }
 
@@ -1681,6 +1718,9 @@ class SignalingServer {
         return;
       case 'admin-stop-viewing':
         void this._handleAdminStopViewing(socketId, ws, msg);
+        return;
+      case 'admin-focus-client-app':
+        void this._handleAdminFocusClientApp(socketId, ws, msg);
         return;
       case 'start-sharing':
       case 'stop-sharing':
@@ -2331,6 +2371,74 @@ class SignalingServer {
       this._send(clientConn.ws, { type: 'agent-disconnected', agentSocketId: socketId, agentName });
     }
     this._send(ws, { type: 'admin-stop-viewing-response', success: true });
+  }
+
+  /**
+   * Ask the member's desktop app to show and focus its window (e.g. user minimized it during share).
+   * Only allowed while this admin socket has an active viewer link to that client (same as streaming).
+   */
+  async _handleAdminFocusClientApp(socketId, ws, msg) {
+    const admin = await this._requireAdmin(socketId, ws, msg);
+    if (!admin) return;
+
+    const access = await this._checkAdminSensitiveAccess(socketId, admin);
+    if (!access.allowed) {
+      this._send(ws, {
+        type: 'access-restricted',
+        code: 'NOT_IN_OFFICE',
+        message: 'You are not connected to the office network.',
+        adminIp: access.adminIp,
+      });
+      return;
+    }
+
+    const clientId = msg.clientId != null ? Number(msg.clientId) : NaN;
+    if (!Number.isFinite(clientId) || clientId <= 0) {
+      this._send(ws, {
+        type: 'admin-focus-client-app-response',
+        success: false,
+        error: 'INVALID_INPUT',
+        message: 'clientId required',
+      });
+      return;
+    }
+
+    const row = await this.db.getClientById(clientId);
+    const client = row && !row.disabled ? row : null;
+    if (!client || client.status === 'offline' || !client.socket_id) {
+      this._send(ws, {
+        type: 'admin-focus-client-app-response',
+        success: false,
+        error: 'CLIENT_UNAVAILABLE',
+        message: 'Client unavailable',
+      });
+      return;
+    }
+
+    const set = this.adminViewerLinks.get(socketId);
+    if (!set || !set.has(client.socket_id)) {
+      this._send(ws, {
+        type: 'admin-focus-client-app-response',
+        success: false,
+        error: 'NOT_VIEWING',
+        message: 'Open this member’s stream first, then use Bring to front.',
+      });
+      return;
+    }
+
+    const clientConn = this.clients.get(client.socket_id);
+    if (!clientConn || clientConn.kind !== 'client' || !isOpen(clientConn.ws)) {
+      this._send(ws, {
+        type: 'admin-focus-client-app-response',
+        success: false,
+        error: 'CLIENT_UNAVAILABLE',
+        message: 'Client connection not found',
+      });
+      return;
+    }
+
+    this._send(clientConn.ws, { type: 'focus-client-app' });
+    this._send(ws, { type: 'admin-focus-client-app-response', success: true });
   }
 
   async _handleIcePathReport(socketId, ws, msg) {
