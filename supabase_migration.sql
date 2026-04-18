@@ -147,6 +147,8 @@ create table if not exists public.browser_tab_events (
 
 create index if not exists idx_browser_tab_events_client on public.browser_tab_events(client_id);
 create index if not exists idx_browser_tab_events_occurred on public.browser_tab_events(occurred_at);
+-- Ingest time (ms) — used for rolling retention of extension/browser snapshots only
+create index if not exists idx_browser_tab_events_received_at on public.browser_tab_events(received_at);
 
 alter table public.browser_tab_events add column if not exists reason text null;
 alter table public.browser_tab_events add column if not exists session_json text null;

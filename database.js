@@ -157,6 +157,35 @@ class SignalingDatabase {
     await this._q(`ALTER TABLE browser_tab_events ADD COLUMN IF NOT EXISTS switch_log_json TEXT NULL`);
     await this._q('CREATE INDEX IF NOT EXISTS idx_browser_tab_events_client ON browser_tab_events(client_id)');
     await this._q('CREATE INDEX IF NOT EXISTS idx_browser_tab_events_occurred ON browser_tab_events(occurred_at)');
+    await this._q(
+      'CREATE INDEX IF NOT EXISTS idx_browser_tab_events_received_at ON browser_tab_events(received_at)'
+    );
+  }
+
+  /**
+   * BrowserScope / extension telemetry rows (`browser_tab_events` only).
+   * Deletes by server ingest time `received_at` (epoch ms). Does not touch call_events, taskbar_events, clients, etc.
+   *
+   * Env: `BROWSER_TAB_RETENTION_DAYS` — default 7; set to 0 to disable automatic deletion.
+   */
+  async purgeBrowserTabEventsExpired() {
+    const raw = process.env.BROWSER_TAB_RETENTION_DAYS;
+    let days = 7;
+    if (raw !== undefined && raw !== '') {
+      const n = Number(raw);
+      if (Number.isFinite(n)) days = Math.max(0, Math.min(366, Math.floor(n)));
+    }
+    if (days <= 0) return { deleted: 0, disabled: true, days: 0 };
+
+    const cutoff = Date.now() - days * 24 * 60 * 60 * 1000;
+    const r = await this._q('DELETE FROM browser_tab_events WHERE received_at < $1', [cutoff]);
+    const deleted = r.rowCount ?? 0;
+    if (deleted > 0) {
+      console.log(
+        `[DB] browser_tab_events retention: removed ${deleted} row(s) with received_at older than ${days} day(s)`
+      );
+    }
+    return { deleted, days, cutoff };
   }
 
   async _ensureRemoteAccessTable() {

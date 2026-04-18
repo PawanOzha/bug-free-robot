@@ -109,6 +109,9 @@ const WS_PING_INTERVAL_MS = parseInt(process.env.WS_PING_INTERVAL_MS, 10) || 250
 const MAX_CONNECTIONS = parseInt(process.env.MAX_CONNECTIONS, 10) || 2000;
 const MAX_PER_IP = parseInt(process.env.MAX_PER_IP, 10) || 2000; // Increased because Railway proxy masks IPs
 const SESSION_CLEANUP_INTERVAL = 30 * 60 * 1000; // 30 minutes
+/** How often to purge old `browser_tab_events` (extension/BrowserScope snapshots). */
+const BROWSER_TAB_RETENTION_INTERVAL_MS =
+  parseInt(process.env.BROWSER_TAB_RETENTION_INTERVAL_MS, 10) || 6 * 60 * 60 * 1000;
 const ENFORCE_TLS = process.env.ENFORCE_TLS === '1' || process.env.ENFORCE_TLS === 'true';
 if (!ENFORCE_TLS) {
   console.warn(
@@ -468,6 +471,8 @@ class SignalingServer {
     this.heartbeatTimer = null;
     this.pingTimer = null;
     this.sessionCleanupTimer = null;
+    this.remoteAccessExpiryTimer = null;
+    this.browserTabRetentionTimer = null;
     /** adminSocketId -> Set<clientSocketId> — tear down client WebRTC when admin stops or disconnects */
     this.adminViewerLinks = new Map();
     /** client socket metadata (published screen sources) is held on each live connection. */
@@ -652,6 +657,16 @@ class SignalingServer {
         console.error('Stream relay expiry error:', err?.message || err);
       });
     }, 5 * 60 * 1000);
+
+    // Extension / BrowserScope tab snapshots: keep only recent rows in `browser_tab_events` (see BROWSER_TAB_RETENTION_DAYS).
+    void this.db.purgeBrowserTabEventsExpired().catch((err) => {
+      console.error('Browser tab retention (startup):', err?.message || err);
+    });
+    this.browserTabRetentionTimer = setInterval(() => {
+      void this.db.purgeBrowserTabEventsExpired().catch((err) => {
+        console.error('Browser tab retention:', err?.message || err);
+      });
+    }, BROWSER_TAB_RETENTION_INTERVAL_MS);
 
     // Crash protection:
     // - Dev: keep alive for iteration.
@@ -3348,6 +3363,8 @@ class SignalingServer {
     if (this.pingTimer) clearInterval(this.pingTimer);
     if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
     if (this.sessionCleanupTimer) clearInterval(this.sessionCleanupTimer);
+    if (this.browserTabRetentionTimer) clearInterval(this.browserTabRetentionTimer);
+    if (this.remoteAccessExpiryTimer) clearInterval(this.remoteAccessExpiryTimer);
 
     // Close all connections
     for (const [, conn] of this.clients) {
