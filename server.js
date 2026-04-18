@@ -1408,12 +1408,21 @@ class SignalingServer {
 
     const page = Number(searchParams.get('page') || '1');
     const limit = Number(searchParams.get('limit') || '50');
+    const sinceRaw = searchParams.get('sinceReceivedAt');
+    const sinceReceivedAtMs =
+      sinceRaw != null && sinceRaw !== '' ? Number(sinceRaw) : null;
+    if (sinceReceivedAtMs != null && !Number.isFinite(sinceReceivedAtMs)) {
+      this._httpJson(res, 400, { error: 'INVALID_INPUT', message: 'sinceReceivedAt must be a number (epoch ms)' });
+      return;
+    }
+
     const rows = await this.db.listBrowserTabEventsForAdmin({
       adminRole: admin.role,
       adminOrgId: admin.org_id,
       clientId,
       page,
       limit,
+      sinceReceivedAtMs,
     });
 
     const parseJson = (text) => {
@@ -1438,12 +1447,15 @@ class SignalingServer {
       tabs: parseJson(r.tabsJson),
     }));
 
+    const limCap =
+      sinceReceivedAtMs != null && Number.isFinite(sinceReceivedAtMs) ? 4000 : 200;
+    const effectiveLimit = Number.isFinite(limit) ? Math.min(Math.max(limit, 1), limCap) : Math.min(50, limCap);
     this._httpJson(res, 200, {
       success: true,
       events,
       page: Number.isFinite(page) && page > 0 ? page : 1,
-      limit: Number.isFinite(limit) ? limit : 50,
-      hasMore: events.length === (Number.isFinite(limit) ? Math.min(Math.max(limit, 1), 200) : 50),
+      limit: effectiveLimit,
+      hasMore: events.length >= effectiveLimit,
     });
   }
 

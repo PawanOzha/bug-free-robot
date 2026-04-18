@@ -903,8 +903,18 @@ class SignalingDatabase {
     }));
   }
 
-  async listBrowserTabEventsForAdmin({ adminRole, adminOrgId, clientId, page, limit }) {
-    const lim = Math.min(Math.max(Number(limit) || 50, 1), 200);
+  async listBrowserTabEventsForAdmin({
+    adminRole,
+    adminOrgId,
+    clientId,
+    page,
+    limit,
+    sinceReceivedAtMs,
+  }) {
+    const hasSince =
+      sinceReceivedAtMs != null && Number.isFinite(Number(sinceReceivedAtMs));
+    const maxLim = hasSince ? 4000 : 200;
+    const lim = Math.min(Math.max(Number(limit) || 50, 1), maxLim);
     const pg = Math.max(Number(page) || 1, 1);
     const offset = (pg - 1) * lim;
 
@@ -919,6 +929,11 @@ class SignalingDatabase {
     if (adminRole === 'org_admin' && adminOrgId != null && Number.isFinite(adminOrgId)) {
       where += ` AND c.org_id = $${params.length + 1}`;
       params.push(adminOrgId);
+    }
+
+    if (hasSince) {
+      where += ` AND bte.received_at >= $${params.length + 1}`;
+      params.push(Number(sinceReceivedAtMs));
     }
 
     const q = `
@@ -936,7 +951,7 @@ class SignalingDatabase {
       FROM browser_tab_events bte
       INNER JOIN clients c ON c.id = bte.client_id AND c.disabled = 0
       ${where}
-      ORDER BY bte.id DESC
+      ORDER BY bte.received_at DESC, bte.id DESC
       LIMIT $${params.length + 1} OFFSET $${params.length + 2}
     `;
     const r = await this._q(q, [...params, lim, offset]);
