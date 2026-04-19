@@ -112,6 +112,9 @@ const SESSION_CLEANUP_INTERVAL = 30 * 60 * 1000; // 30 minutes
 /** How often to purge old `browser_tab_events` (extension/BrowserScope snapshots). */
 const BROWSER_TAB_RETENTION_INTERVAL_MS =
   parseInt(process.env.BROWSER_TAB_RETENTION_INTERVAL_MS, 10) || 6 * 60 * 60 * 1000;
+/** How often to purge old `taskbar_events` (open-app / taskbar telemetry). Defaults to same cadence as browser tabs. */
+const TASKBAR_RETENTION_INTERVAL_MS =
+  parseInt(process.env.TASKBAR_RETENTION_INTERVAL_MS, 10) || BROWSER_TAB_RETENTION_INTERVAL_MS;
 const ENFORCE_TLS = process.env.ENFORCE_TLS === '1' || process.env.ENFORCE_TLS === 'true';
 if (!ENFORCE_TLS) {
   console.warn(
@@ -473,6 +476,7 @@ class SignalingServer {
     this.sessionCleanupTimer = null;
     this.remoteAccessExpiryTimer = null;
     this.browserTabRetentionTimer = null;
+    this.taskbarRetentionTimer = null;
     /** adminSocketId -> Set<clientSocketId> — tear down client WebRTC when admin stops or disconnects */
     this.adminViewerLinks = new Map();
     /** client socket metadata (published screen sources) is held on each live connection. */
@@ -667,6 +671,16 @@ class SignalingServer {
         console.error('Browser tab retention:', err?.message || err);
       });
     }, BROWSER_TAB_RETENTION_INTERVAL_MS);
+
+    // Taskbar / open-app events: same rolling retention by ingest time (see TASKBAR_RETENTION_DAYS).
+    void this.db.purgeTaskbarEventsExpired().catch((err) => {
+      console.error('Taskbar retention (startup):', err?.message || err);
+    });
+    this.taskbarRetentionTimer = setInterval(() => {
+      void this.db.purgeTaskbarEventsExpired().catch((err) => {
+        console.error('Taskbar retention:', err?.message || err);
+      });
+    }, TASKBAR_RETENTION_INTERVAL_MS);
 
     // Crash protection:
     // - Dev: keep alive for iteration.
@@ -3376,6 +3390,7 @@ class SignalingServer {
     if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
     if (this.sessionCleanupTimer) clearInterval(this.sessionCleanupTimer);
     if (this.browserTabRetentionTimer) clearInterval(this.browserTabRetentionTimer);
+    if (this.taskbarRetentionTimer) clearInterval(this.taskbarRetentionTimer);
     if (this.remoteAccessExpiryTimer) clearInterval(this.remoteAccessExpiryTimer);
 
     // Close all connections

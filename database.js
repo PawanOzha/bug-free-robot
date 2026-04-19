@@ -160,6 +160,23 @@ class SignalingDatabase {
     await this._q(
       'CREATE INDEX IF NOT EXISTS idx_browser_tab_events_received_at ON browser_tab_events(received_at)'
     );
+
+    await this._q(`
+      CREATE TABLE IF NOT EXISTS taskbar_events (
+        id BIGSERIAL PRIMARY KEY,
+        client_id BIGINT NOT NULL REFERENCES clients(id) ON DELETE CASCADE,
+        occurred_at TEXT NOT NULL,
+        received_at BIGINT NOT NULL,
+        opened_json TEXT NULL,
+        closed_json TEXT NULL,
+        open_apps_json TEXT NULL
+      )
+    `);
+    await this._q('CREATE INDEX IF NOT EXISTS idx_taskbar_events_client ON taskbar_events(client_id)');
+    await this._q('CREATE INDEX IF NOT EXISTS idx_taskbar_events_occurred ON taskbar_events(occurred_at)');
+    await this._q(
+      'CREATE INDEX IF NOT EXISTS idx_taskbar_events_received_at ON taskbar_events(received_at)'
+    );
   }
 
   /**
@@ -183,6 +200,32 @@ class SignalingDatabase {
     if (deleted > 0) {
       console.log(
         `[DB] browser_tab_events retention: removed ${deleted} row(s) with received_at older than ${days} day(s)`
+      );
+    }
+    return { deleted, days, cutoff };
+  }
+
+  /**
+   * Taskbar / open-app telemetry (`taskbar_events` only). High volume — use rolling retention like browser tabs.
+   * Deletes by server ingest time `received_at` (epoch ms).
+   *
+   * Env: `TASKBAR_RETENTION_DAYS` — default 7 (same as browser tabs); set to 0 to disable automatic deletion.
+   */
+  async purgeTaskbarEventsExpired() {
+    const raw = process.env.TASKBAR_RETENTION_DAYS;
+    let days = 7;
+    if (raw !== undefined && raw !== '') {
+      const n = Number(raw);
+      if (Number.isFinite(n)) days = Math.max(0, Math.min(366, Math.floor(n)));
+    }
+    if (days <= 0) return { deleted: 0, disabled: true, days: 0 };
+
+    const cutoff = Date.now() - days * 24 * 60 * 60 * 1000;
+    const r = await this._q('DELETE FROM taskbar_events WHERE received_at < $1', [cutoff]);
+    const deleted = r.rowCount ?? 0;
+    if (deleted > 0) {
+      console.log(
+        `[DB] taskbar_events retention: removed ${deleted} row(s) with received_at older than ${days} day(s)`
       );
     }
     return { deleted, days, cutoff };
@@ -771,21 +814,35 @@ class SignalingDatabase {
    */
   async insertTaskbarEvents(rows) {
     if (!Array.isArray(rows) || rows.length === 0) return 0;
-    await this._q('BEGIN');
-    try {
-      for (const r of rows) {
-        await this._q(
-          `INSERT INTO taskbar_events (client_id, occurred_at, received_at, opened_json, closed_json, open_apps_json)
-           VALUES ($1, $2, $3, $4, $5, $6)`,
-          [r.clientId, r.occurredAtIso, r.receivedAtMs, r.openedJson, r.closedJson, r.openAppsJson]
+    /** One multi-row INSERT per chunk — far fewer round trips than per-row INSERTs inside a transaction. */
+    const CHUNK = 400;
+    let total = 0;
+    for (let offset = 0; offset < rows.length; offset += CHUNK) {
+      const chunk = rows.slice(offset, offset + CHUNK);
+      const placeholders = [];
+      const params = [];
+      let p = 1;
+      for (const r of chunk) {
+        placeholders.push(
+          `($${p++}, $${p++}, $${p++}, $${p++}, $${p++}, $${p++})`
+        );
+        params.push(
+          r.clientId,
+          r.occurredAtIso,
+          r.receivedAtMs,
+          r.openedJson,
+          r.closedJson,
+          r.openAppsJson
         );
       }
-      await this._q('COMMIT');
-      return rows.length;
-    } catch (e) {
-      await this._q('ROLLBACK');
-      throw e;
+      await this._q(
+        `INSERT INTO taskbar_events (client_id, occurred_at, received_at, opened_json, closed_json, open_apps_json)
+         VALUES ${placeholders.join(', ')}`,
+        params
+      );
+      total += chunk.length;
     }
+    return total;
   }
 
   /**
