@@ -1263,7 +1263,7 @@ class SignalingServer {
       const isPinned = v.isPinned === true;
       const isAudible = v.isAudible === true;
       const isMuted = v.isMuted === true;
-      if (!title && !url) return null;
+      if (!title && !url && !domain) return null;
       const dwellIdleMsRaw = Number(v.dwellIdleMs ?? v.dwell_idle_ms ?? 0);
       const keystrokesRaw = Number(v.keystrokes ?? 0);
       const scrollPxRaw = Number(v.scrollPx ?? v.scroll_px ?? 0);
