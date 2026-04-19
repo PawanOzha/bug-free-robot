@@ -137,10 +137,15 @@ console.log(`[Ingest] INGEST_TOKEN_SECRET present: ${!!INGEST_TOKEN_SECRET}`);
 const ALLOW_CALL_EVENTS_WITHOUT_TOKEN =
   process.env.ALLOW_CALL_EVENTS_WITHOUT_TOKEN === '1' ||
   process.env.ALLOW_CALL_EVENTS_WITHOUT_TOKEN === 'true';
-// Temporarily disable taskbar/browser-tab telemetry end-to-end (not just UI).
+// Taskbar + browser extension tab telemetry (ingest + WS broadcast to audit admins).
+// Default ON so real-time BrowserScope → audit works without extra Railway env.
+// Set ENABLE_APP_ACTIVITY_TELEMETRY=0 or false to disable.
+const _appTelRaw = String(process.env.ENABLE_APP_ACTIVITY_TELEMETRY ?? '').trim().toLowerCase();
 const ENABLE_APP_ACTIVITY_TELEMETRY =
-  process.env.ENABLE_APP_ACTIVITY_TELEMETRY === '1' ||
-  process.env.ENABLE_APP_ACTIVITY_TELEMETRY === 'true';
+  _appTelRaw === '0' || _appTelRaw === 'false' || _appTelRaw === 'off' || _appTelRaw === 'no'
+    ? false
+    : true;
+console.log(`[Telemetry] ENABLE_APP_ACTIVITY_TELEMETRY=${ENABLE_APP_ACTIVITY_TELEMETRY} (browser tabs + taskbar ingest/broadcast)`);
 
 const MAX_MESSAGE_BYTES = 64 * 1024;
 const MAX_HTTP_BODY_BYTES = 256 * 1024;
