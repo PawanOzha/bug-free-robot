@@ -146,6 +146,13 @@ const ENABLE_APP_ACTIVITY_TELEMETRY =
     ? false
     : true;
 console.log(`[Telemetry] ENABLE_APP_ACTIVITY_TELEMETRY=${ENABLE_APP_ACTIVITY_TELEMETRY} (browser tabs + taskbar ingest/broadcast)`);
+// Real-time fast lane: when false, browser-tab ingest still broadcasts to admins but skips DB writes.
+const _tabPersistRaw = String(process.env.BROWSER_TAB_PERSIST_TO_DB ?? '1').trim().toLowerCase();
+const BROWSER_TAB_PERSIST_TO_DB =
+  _tabPersistRaw === '0' || _tabPersistRaw === 'false' || _tabPersistRaw === 'off' || _tabPersistRaw === 'no'
+    ? false
+    : true;
+console.log(`[Telemetry] BROWSER_TAB_PERSIST_TO_DB=${BROWSER_TAB_PERSIST_TO_DB} (when false: WS live-only, no browser_tab_events writes)`);
 
 const MAX_MESSAGE_BYTES = 64 * 1024;
 const MAX_HTTP_BODY_BYTES = 256 * 1024;
@@ -482,6 +489,8 @@ class SignalingServer {
     this.remoteAccessExpiryTimer = null;
     this.browserTabRetentionTimer = null;
     this.taskbarRetentionTimer = null;
+    /** Latest browser-tab snapshot per client (used for fast live-only mode and in-memory fallback). */
+    this.latestBrowserTabByClientId = new Map();
     /** adminSocketId -> Set<clientSocketId> — tear down client WebRTC when admin stops or disconnects */
     this.adminViewerLinks = new Map();
     /** client socket metadata (published screen sources) is held on each live connection. */
@@ -1344,22 +1353,47 @@ class SignalingServer {
       return;
     }
 
-    const accepted = await this.db.insertBrowserTabEvents(rows);
     const latestTabs = rows.length > 0 ? JSON.parse(rows[rows.length - 1].tabsJson) : [];
     const latestActiveTabId = rows.length > 0 ? rows[rows.length - 1].activeTabId : null;
     const latestBrowser = rows.length > 0 ? rows[rows.length - 1].browserName : 'Chromium';
+    let latestSession = {};
     let latestRecentInteractions = [];
     if (rows.length > 0) {
       try {
         const lastSess = JSON.parse(rows[rows.length - 1].sessionJson || '{}');
+        latestSession = lastSess && typeof lastSess === 'object' ? lastSess : {};
         if (Array.isArray(lastSess.recentInteractions)) latestRecentInteractions = lastSess.recentInteractions;
       } catch {
-        /* ignore */
+        latestSession = {};
       }
     }
-    console.log(`[Received from Client ---] Browser tab events: ${accepted} event(s) ingested for clientId=${clientId} | tabs=${latestTabs.length}`);
-    this._broadcastBrowserTabEventsToAdmins(clientId, accepted, latestTabs, latestActiveTabId, latestBrowser, latestRecentInteractions);
-    this._httpJson(res, 200, { ok: true, accepted });
+    const latestOccurredAt = rows.length > 0 ? rows[rows.length - 1].occurredAtIso : new Date(receivedAtMs).toISOString();
+    const latestReason = rows.length > 0 ? rows[rows.length - 1].reason : 'update';
+    const latestSnapshot = {
+      id: 0,
+      clientId,
+      timestamp: latestOccurredAt,
+      receivedAt: new Date(receivedAtMs).toISOString(),
+      browserName: latestBrowser,
+      activeTabId: latestActiveTabId,
+      reason: latestReason,
+      session: latestSession,
+      switchLog: rows.length > 0 ? JSON.parse(rows[rows.length - 1].switchLogJson || '[]') : [],
+      tabs: latestTabs,
+    };
+    this.latestBrowserTabByClientId.set(clientId, latestSnapshot);
+
+    // Fast path: broadcast immediately so admin UI updates are not delayed by DB writes.
+    this._broadcastBrowserTabEventsToAdmins(clientId, rows.length, latestTabs, latestActiveTabId, latestBrowser, latestRecentInteractions);
+
+    let accepted = rows.length;
+    if (BROWSER_TAB_PERSIST_TO_DB) {
+      accepted = await this.db.insertBrowserTabEvents(rows);
+    }
+    console.log(
+      `[Received from Client ---] Browser tab events: ${accepted} event(s) ${BROWSER_TAB_PERSIST_TO_DB ? 'persisted' : 'live-only'} for clientId=${clientId} | tabs=${latestTabs.length}`,
+    );
+    this._httpJson(res, 200, { ok: true, accepted, persisted: BROWSER_TAB_PERSIST_TO_DB });
   }
 
   async _httpGetBrowserTabEvents(req, res) {
@@ -1432,6 +1466,30 @@ class SignalingServer {
       sinceRaw != null && sinceRaw !== '' ? Number(sinceRaw) : null;
     if (sinceReceivedAtMs != null && !Number.isFinite(sinceReceivedAtMs)) {
       this._httpJson(res, 400, { error: 'INVALID_INPUT', message: 'sinceReceivedAt must be a number (epoch ms)' });
+      return;
+    }
+
+    if (!BROWSER_TAB_PERSIST_TO_DB) {
+      if (clientId == null) {
+        this._httpJson(res, 200, {
+          success: true,
+          events: [],
+          page: 1,
+          limit: 0,
+          hasMore: false,
+          liveOnly: true,
+        });
+        return;
+      }
+      const snap = this.latestBrowserTabByClientId.get(clientId);
+      this._httpJson(res, 200, {
+        success: true,
+        events: snap ? [snap] : [],
+        page: 1,
+        limit: 1,
+        hasMore: false,
+        liveOnly: true,
+      });
       return;
     }
 
